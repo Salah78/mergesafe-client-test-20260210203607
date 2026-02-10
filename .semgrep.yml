@@ -1,0 +1,32 @@
+rules:
+  - id: python-dangerous-eval
+    languages: [python]
+    message: Avoid eval() on untrusted input.
+    severity: ERROR
+    patterns:
+      - pattern: eval(...)
+
+  - id: js-dangerous-eval
+    languages: [javascript, typescript]
+    message: Avoid eval() in JavaScript/TypeScript.
+    severity: ERROR
+    patterns:
+      - pattern: eval(...)
+
+  - id: python-subprocess-shell-true
+    languages: [python]
+    message: subprocess with shell=True can lead to command injection.
+    severity: WARNING
+    patterns:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: "(run|Popen|call|check_output|check_call)"
+
+  - id: js-innerhtml-assignment
+    languages: [javascript, typescript]
+    message: Direct innerHTML assignment can enable XSS.
+    severity: WARNING
+    patterns:
+      - pattern: $EL.innerHTML = $VAL
+
