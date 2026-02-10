@@ -1,0 +1,528 @@
+name: MergeSafe Security Scan
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  security-scan:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      MERGESAFE_MODE: "bootstrap"
+      SEMGREP_VERSION: "1.93.0"
+      CHECKOV_VERSION: "3.2.469"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Detect Python dependency files
+        id: detect_py_deps
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          dep_files=()
+          for f in requirements.txt requirements/*.txt **/requirements.txt **/pyproject.toml pyproject.toml; do
+            if [[ -f "${f}" ]]; then
+              dep_files+=("${f}")
+            fi
+          done
+
+          if [[ ${#dep_files[@]} -eq 0 ]]; then
+            echo "has_py_deps=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "has_py_deps=true" >> "${GITHUB_OUTPUT}"
+          {
+            echo "cache_dependency_path<<EOF"
+            printf '%s\n' "${dep_files[@]}" | sort -u
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Python (with pip cache)
+        if: steps.detect_py_deps.outputs.has_py_deps == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: ${{ steps.detect_py_deps.outputs.cache_dependency_path }}
+
+      - name: Setup Python (no cache)
+        if: steps.detect_py_deps.outputs.has_py_deps != 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+
+      - name: Install scanners (pinned versions, isolated)
+        shell: bash
+        run: |
+          set +e
+          set -u -o pipefail
+          python -m pip install --upgrade pipx
+          pipx_exit=$?
+          if [[ "${pipx_exit}" != "0" ]]; then
+            echo "::warning::pipx installation failed (${pipx_exit}); semgrep/checkov steps will still run with fallback report generation."
+          fi
+
+          python -m pipx install "semgrep==${SEMGREP_VERSION}"
+          semgrep_install_exit=$?
+          if [[ "${semgrep_install_exit}" != "0" ]]; then
+            echo "::warning::semgrep installation failed (${semgrep_install_exit}); semgrep step will produce error placeholder report."
+          fi
+
+          python -m pipx inject --force semgrep "setuptools<81"
+          semgrep_inject_exit=$?
+          if [[ "${semgrep_inject_exit}" != "0" ]]; then
+            echo "::warning::semgrep setuptools injection failed (${semgrep_inject_exit}); semgrep step may fail and emit placeholder report."
+          fi
+
+          python -m pipx install "checkov==${CHECKOV_VERSION}"
+          checkov_install_exit=$?
+          if [[ "${checkov_install_exit}" != "0" ]]; then
+            echo "::warning::checkov installation failed (${checkov_install_exit}); checkov step will produce error placeholder report."
+          fi
+
+          echo "$HOME/.local/bin" >> "${GITHUB_PATH}"
+          echo "/opt/pipx_bin" >> "${GITHUB_PATH}"
+          if ! command -v semgrep >/dev/null 2>&1; then
+            echo "::warning::semgrep binary not found on PATH after pipx install."
+          fi
+          if ! command -v checkov >/dev/null 2>&1; then
+            echo "::warning::checkov binary not found on PATH after pipx install."
+          fi
+          if ! semgrep --version; then
+            echo "::warning::semgrep --version failed during bootstrap install check; scan step will continue in non-blocking mode."
+          fi
+          if ! checkov --version; then
+            echo "::warning::checkov --version failed during bootstrap install check; scan step will continue in non-blocking mode."
+          fi
+          exit 0
+
+      - name: Detect IaC files
+        id: detect_iac
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          has_iac=false
+          for f in **/*.tf **/*.tfvars infra/k8s/**/*.yml infra/k8s/**/*.yaml k8s/**/*.yml k8s/**/*.yaml **/Chart.yaml **/values.yaml; do
+            has_iac=true
+            break
+          done
+          echo "has_iac=${has_iac}" >> "${GITHUB_OUTPUT}"
+
+      - name: Gitleaks scan
+        id: gitleaks
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          GITLEAKS_VERSION="8.24.3"
+          exit_code=0
+
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz || exit_code=$?
+          if [[ "${exit_code}" == "0" ]]; then
+            tar -xzf gitleaks.tar.gz gitleaks || exit_code=$?
+          fi
+          if [[ "${exit_code}" == "0" ]]; then
+            chmod +x ./gitleaks || exit_code=$?
+          fi
+          if [[ "${exit_code}" == "0" ]]; then
+            ./gitleaks version || exit_code=$?
+          fi
+          if [[ "${exit_code}" == "0" ]]; then
+            if [[ -f ".gitleaks.toml" ]]; then
+              ./gitleaks detect --source . --config .gitleaks.toml --redact --report-format json --report-path gitleaks.json || exit_code=$?
+            else
+              ./gitleaks detect --source . --redact --report-format json --report-path gitleaks.json || exit_code=$?
+            fi
+          fi
+
+          if [[ ! -f gitleaks.json ]]; then
+            echo '{"findings":[],"errors":[{"message":"gitleaks report was not generated; inspect gitleaks logs."}]}' > gitleaks.json
+          fi
+          echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      - name: Gitleaks summary
+        if: always()
+        shell: bash
+        env:
+          GITLEAKS_EXIT: ${{ steps.gitleaks.outputs.exit_code }}
+        run: |
+          python - <<'PY' >> "${GITHUB_STEP_SUMMARY}"
+          import os
+          import json
+          from pathlib import Path
+
+          print("## Gitleaks summary")
+          exit_code = os.getenv("GITLEAKS_EXIT", "0")
+          status = "pass" if exit_code == "0" else "fail"
+          print(f"- Status: {status}")
+          print(f"- Exit code: {exit_code}")
+          print("- If failure, review the Gitleaks step logs.")
+
+          report_path = Path("gitleaks.json")
+          if not report_path.exists():
+              print("- gitleaks.json was not generated. Check Gitleaks step logs.")
+              raise SystemExit(0)
+
+          try:
+              payload = json.loads(report_path.read_text(encoding="utf-8"))
+          except Exception:
+              print(f"- Report detected at `{report_path}`, but could not parse it as JSON.")
+              raise SystemExit(0)
+
+          findings = payload if isinstance(payload, list) else payload.get("findings", [])
+          if isinstance(findings, list):
+              print(f"- Findings in report: {len(findings)}")
+          else:
+              print("- Findings in report: unavailable (unexpected schema).")
+          print(f"- Local report file: `{report_path}`")
+          PY
+
+      - name: Upload Gitleaks JSON artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mergesafe-gitleaks
+          path: gitleaks.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Semgrep scan
+        id: semgrep
+        shell: bash
+        run: |
+          set +e
+          semgrep scan --config .semgrep.yml --severity ERROR --json --output semgrep.json --error .
+          exit_code=$?
+          if [[ ! -f semgrep.json ]]; then
+            echo '{"results":[],"errors":[{"message":"semgrep report was not generated; inspect semgrep logs."}]}' > semgrep.json
+          fi
+          echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      - name: Upload Semgrep JSON artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mergesafe-semgrep
+          path: semgrep.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Semgrep summary
+        if: always()
+        shell: bash
+        env:
+          SEMGREP_EXIT: ${{ steps.semgrep.outputs.exit_code }}
+        run: |
+          python - <<'PY' >> "${GITHUB_STEP_SUMMARY}"
+          import os
+          import json
+          from collections import Counter
+          from pathlib import Path
+
+          exit_code = os.getenv("SEMGREP_EXIT", "0")
+          report = Path("semgrep.json")
+          print("## Semgrep summary")
+          print(f"- Exit code: {exit_code}")
+          if not report.exists():
+            print("- semgrep.json was not generated. Check Semgrep step logs.")
+            print("- Full output: job logs.")
+            raise SystemExit(0)
+
+          try:
+            payload = json.loads(report.read_text(encoding="utf-8"))
+          except Exception:
+            print("- semgrep.json exists but could not be parsed as JSON.")
+            print("- Full output: job logs and artifact `mergesafe-semgrep`.")
+            raise SystemExit(0)
+
+          results = payload.get("results", [])
+          if not isinstance(results, list):
+            print("- ERROR findings: unavailable (unexpected schema)")
+            print("- Full output: job logs and artifact `mergesafe-semgrep`.")
+            raise SystemExit(0)
+
+          print(f"- ERROR findings: {len(results)}")
+
+          top = Counter(item.get("check_id", "unknown-rule") for item in results).most_common(5)
+          if top:
+            print("- Top rule IDs hit:")
+            for rule_id, count in top:
+              print(f"  - {rule_id}: {count}")
+          else:
+            print("- Top rule IDs hit: none")
+
+          print("- Full output: job logs and artifact `mergesafe-semgrep`.")
+          PY
+
+      - name: Checkov scan
+        id: checkov
+        if: always() && steps.detect_iac.outputs.has_iac == 'true'
+        shell: bash
+        run: |
+          set +e
+          checkov -d . --framework terraform,kubernetes --hard-fail-on HIGH,CRITICAL -o json --output-file-path checkov.json --quiet
+          exit_code=$?
+          if [[ ! -f checkov.json ]]; then
+            echo '{"results":{"failed_checks":[]},"summary":{"passed":0,"failed":0,"skipped":0,"parsing_errors":0},"errors":[{"message":"checkov report was not generated; inspect checkov logs."}]}' > checkov.json
+          fi
+          echo "exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      - name: Checkov skip placeholder
+        if: always() && steps.detect_iac.outputs.has_iac != 'true'
+        shell: bash
+        run: |
+          if [[ ! -f checkov.json ]]; then
+            echo '{"results":{"failed_checks":[]},"summary":{"passed":0,"failed":0,"skipped":0,"parsing_errors":0},"skipped":true}' > checkov.json
+          fi
+
+      - name: Upload Checkov JSON artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mergesafe-checkov
+          path: checkov.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Checkov summary
+        if: always()
+        shell: bash
+        env:
+          CHECKOV_EXIT: ${{ steps.checkov.outputs.exit_code }}
+          HAS_IAC: ${{ steps.detect_iac.outputs.has_iac }}
+        run: |
+          python - <<'PY' >> "${GITHUB_STEP_SUMMARY}"
+          import json
+          import os
+          from pathlib import Path
+
+          print("## Checkov summary")
+          has_iac = os.getenv("HAS_IAC", "false").lower() == "true"
+          exit_code = os.getenv("CHECKOV_EXIT", "0")
+          print(f"- Exit code: {exit_code if has_iac else 'n/a (no IaC files detected)'}")
+
+          report = Path("checkov.json")
+          if not report.exists():
+              print("- checkov.json was not generated.")
+              raise SystemExit(0)
+
+          try:
+              payload = json.loads(report.read_text(encoding="utf-8") or "{}")
+          except Exception:
+              print("- checkov.json exists but could not be parsed as JSON.")
+              raise SystemExit(0)
+
+          if payload.get("skipped") is True:
+              print("- Status: skipped (no IaC files detected)")
+              raise SystemExit(0)
+
+          failed_checks = (payload.get("results") or {}).get("failed_checks", [])
+          if isinstance(failed_checks, list):
+              print(f"- Failed checks: {len(failed_checks)}")
+          else:
+              print("- Failed checks: unavailable (unexpected schema)")
+
+          errors = payload.get("errors", [])
+          if isinstance(errors, list) and errors:
+              print(f"- Parser/runtime errors: {len(errors)}")
+          PY
+
+      - name: Normalize scanner results
+        id: normalize_results
+        if: always()
+        shell: bash
+        env:
+          HAS_IAC: ${{ steps.detect_iac.outputs.has_iac }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          has_iac = os.getenv("HAS_IAC", "false").lower() == "true"
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+
+          def set_output(key: str, value: int | str) -> None:
+              with output_path.open("a", encoding="utf-8") as fh:
+                  fh.write(f"{key}={value}\n")
+
+          def parse_gitleaks() -> tuple[int, int]:
+              report = Path("gitleaks.json")
+              if not report.exists():
+                  return 0, 1
+              try:
+                  payload = json.loads(report.read_text(encoding="utf-8") or "[]")
+                  if isinstance(payload, list):
+                      return len(payload), 0
+
+                  if not isinstance(payload, dict):
+                      return 0, 1
+
+                  findings = payload.get("findings", [])
+                  errors = payload.get("errors", [])
+                  if not isinstance(findings, list):
+                      return 0, 1
+                  if isinstance(errors, list) and len(errors) > 0:
+                      return len(findings), 1
+                  return len(findings), 0
+              except Exception:
+                  return 0, 1
+
+          def parse_semgrep() -> tuple[int, int]:
+              report = Path("semgrep.json")
+              if not report.exists():
+                  return 0, 1
+              try:
+                  payload = json.loads(report.read_text(encoding="utf-8") or "{}")
+                  findings = payload.get("results", [])
+                  errors = payload.get("errors", [])
+                  if not isinstance(findings, list):
+                      return 0, 1
+                  if isinstance(errors, list) and len(errors) > 0:
+                      return len(findings), 1
+                  return len(findings), 0
+              except Exception:
+                  return 0, 1
+
+          def parse_checkov() -> tuple[int, int]:
+              if not has_iac:
+                  return 0, 0
+              report = Path("checkov.json")
+              if not report.exists():
+                  return 0, 1
+              try:
+                  payload = json.loads(report.read_text(encoding="utf-8") or "{}")
+                  if payload.get("skipped") is True:
+                      return 0, 0
+                  findings = (payload.get("results") or {}).get("failed_checks", [])
+                  errors = payload.get("errors", [])
+                  if not isinstance(findings, list):
+                      return 0, 1
+                  if isinstance(errors, list) and len(errors) > 0:
+                      return len(findings), 1
+                  return len(findings), 0
+              except Exception:
+                  return 0, 1
+
+          gitleaks_findings, gitleaks_parse_error = parse_gitleaks()
+          semgrep_findings, semgrep_parse_error = parse_semgrep()
+          checkov_findings, checkov_parse_error = parse_checkov()
+
+          total_findings = gitleaks_findings + semgrep_findings + checkov_findings
+          report_parse_error = int(
+              bool(gitleaks_parse_error or semgrep_parse_error or checkov_parse_error)
+          )
+          would_fail_in_enforce = int(bool(total_findings > 0 or report_parse_error))
+
+          set_output("gitleaks_findings", gitleaks_findings)
+          set_output("semgrep_findings", semgrep_findings)
+          set_output("checkov_findings", checkov_findings)
+          set_output("total_findings", total_findings)
+          set_output("report_parse_error", report_parse_error)
+          set_output("would_fail_in_enforce", would_fail_in_enforce)
+          PY
+
+      - name: MergeSafe mode summary
+        if: always()
+        shell: bash
+        env:
+          ACTIVE_MODE: ${{ env.MERGESAFE_MODE }}
+          HAS_IAC: ${{ steps.detect_iac.outputs.has_iac }}
+          GITLEAKS_EXIT: ${{ steps.gitleaks.outputs.exit_code }}
+          SEMGREP_EXIT: ${{ steps.semgrep.outputs.exit_code }}
+          CHECKOV_EXIT: ${{ steps.checkov.outputs.exit_code }}
+          GITLEAKS_FINDINGS: ${{ steps.normalize_results.outputs.gitleaks_findings }}
+          SEMGREP_FINDINGS: ${{ steps.normalize_results.outputs.semgrep_findings }}
+          CHECKOV_FINDINGS: ${{ steps.normalize_results.outputs.checkov_findings }}
+          TOTAL_FINDINGS: ${{ steps.normalize_results.outputs.total_findings }}
+          REPORT_PARSE_ERROR: ${{ steps.normalize_results.outputs.report_parse_error }}
+          WOULD_FAIL_IN_ENFORCE: ${{ steps.normalize_results.outputs.would_fail_in_enforce }}
+        run: |
+          gitleaks_exit="${GITLEAKS_EXIT:-0}"
+          semgrep_exit="${SEMGREP_EXIT:-0}"
+          checkov_exit="${CHECKOV_EXIT:-0}"
+          gitleaks_findings="${GITLEAKS_FINDINGS:-0}"
+          semgrep_findings="${SEMGREP_FINDINGS:-0}"
+          checkov_findings="${CHECKOV_FINDINGS:-0}"
+          total_findings="${TOTAL_FINDINGS:-0}"
+          parse_error="${REPORT_PARSE_ERROR:-0}"
+          would_fail="${WOULD_FAIL_IN_ENFORCE:-0}"
+          {
+            echo "## MergeSafe mode summary";
+            echo "";
+            echo "- Mode: ${ACTIVE_MODE}";
+            echo "- gitleaks exit code: ${gitleaks_exit}";
+            echo "- semgrep exit code: ${semgrep_exit}";
+            if [[ "${HAS_IAC}" == "true" ]]; then
+              echo "- checkov exit code: ${checkov_exit}";
+              echo "- checkov findings: ${checkov_findings}";
+            else
+              echo "- checkov exit code: n/a (no IaC files detected)";
+              echo "- checkov findings: n/a (no IaC files detected)";
+            fi
+            echo "- gitleaks findings: ${gitleaks_findings}";
+            echo "- semgrep findings: ${semgrep_findings}";
+            echo "- total findings: ${total_findings}";
+            echo "- report parse error: ${parse_error}";
+            echo "- would fail in enforce: ${would_fail}";
+            echo "";
+            if [[ "${ACTIVE_MODE}" == "bootstrap" ]]; then
+              echo "- Bootstrap mode keeps the workflow green while preserving scanner artifacts.";
+            else
+              echo "- Enforce mode fails on scanner exit codes, findings, or report parse errors.";
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Enforce mode gate
+        if: always()
+        shell: bash
+        env:
+          ACTIVE_MODE: ${{ env.MERGESAFE_MODE }}
+          HAS_IAC: ${{ steps.detect_iac.outputs.has_iac }}
+          GITLEAKS_EXIT: ${{ steps.gitleaks.outputs.exit_code }}
+          SEMGREP_EXIT: ${{ steps.semgrep.outputs.exit_code }}
+          CHECKOV_EXIT: ${{ steps.checkov.outputs.exit_code }}
+          TOTAL_FINDINGS: ${{ steps.normalize_results.outputs.total_findings }}
+          REPORT_PARSE_ERROR: ${{ steps.normalize_results.outputs.report_parse_error }}
+        run: |
+          mode="${ACTIVE_MODE:-bootstrap}"
+          total_findings="${TOTAL_FINDINGS:-0}"
+          report_parse_error="${REPORT_PARSE_ERROR:-0}"
+
+          failures=()
+          [[ "${GITLEAKS_EXIT:-0}" != "0" ]] && failures+=("gitleaks_exit=${GITLEAKS_EXIT}")
+          [[ "${SEMGREP_EXIT:-0}" != "0" ]] && failures+=("semgrep_exit=${SEMGREP_EXIT}")
+          if [[ "${HAS_IAC}" == "true" && "${CHECKOV_EXIT:-0}" != "0" ]]; then
+            failures+=("checkov_exit=${CHECKOV_EXIT}")
+          fi
+          if [[ "${total_findings}" != "0" ]]; then
+            failures+=("total_findings=${total_findings}")
+          fi
+          if [[ "${report_parse_error}" != "0" ]]; then
+            failures+=("report_parse_error=${report_parse_error}")
+          fi
+
+          if [[ "${mode}" != "enforce" ]]; then
+            if (( ${#failures[@]} > 0 )); then
+              echo "::warning::Bootstrap mode non-blocking: run would fail in enforce (${failures[*]})"
+            fi
+            exit 0
+          fi
+
+          if (( ${#failures[@]} > 0 )); then
+            echo "::error::MERGESAFE_MODE=enforce blocking gate triggered (${failures[*]})"
+            exit 1
+          fi
