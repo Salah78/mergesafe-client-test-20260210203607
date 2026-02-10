@@ -266,6 +266,12 @@ jobs:
           print("- Full output: job logs and artifact `mergesafe-semgrep`.")
           PY
 
+      - name: Test corrupt semgrep report
+        if: always()
+        shell: bash
+        run: |
+          echo '{invalid_json' > semgrep.json
+
       - name: Checkov scan
         id: checkov
         if: always() && steps.detect_iac.outputs.has_iac == 'true'
