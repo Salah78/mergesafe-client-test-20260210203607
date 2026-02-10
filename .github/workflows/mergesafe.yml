@@ -15,7 +15,7 @@ jobs:
     permissions:
       contents: read
     env:
-      MERGESAFE_MODE: "bootstrap"
+      MERGESAFE_MODE: "enforce"
       SEMGREP_VERSION: "1.93.0"
       CHECKOV_VERSION: "3.2.469"
 
